@@ -104,16 +104,16 @@ spec:
         pip install -r requirements.txt
         nosetests $(params.args)
 
+
+
 ---
-apiVersion: tekton.dev/v1beta1
+apiVersion: tekton.dev/v1
 kind: Task
 metadata:
   name: buildah
 spec:
-  description: Build and push the application container image.
   params:
     - name: IMAGE
-      description: Full destination image reference.
       type: string
   workspaces:
     - name: source
@@ -122,12 +122,19 @@ spec:
       image: quay.io/buildah/stable:v1.35.0
       workingDir: $(workspaces.source.path)
       securityContext:
-        privileged: true
+        privileged: false
+        capabilities:
+          add:
+            - SETFCAP
       script: |
-        #!/bin/sh
-        set -eu
-        buildah bud --storage-driver=vfs -t "$(params.IMAGE)" .
-        buildah push --storage-driver=vfs "$(params.IMAGE)"
+        buildah bud \
+          --storage-driver=vfs \
+          --isolation=chroot \
+          -t "$(params.IMAGE)" .
+
+        buildah push \
+          --storage-driver=vfs \
+          "$(params.IMAGE)"
 
 ---
 apiVersion: tekton.dev/v1beta1
