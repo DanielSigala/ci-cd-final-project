@@ -5,34 +5,79 @@ kind: Task
 metadata:
   name: cleanup
 spec:
-  description: This task will clean up a workspace by deleting all the files.
+  description: Clean up the source workspace.
   workspaces:
     - name: source
   steps:
     - name: remove
       image: alpine:3
-      env:
-        - name: WORKSPACE_SOURCE_PATH
-          value: $(workspaces.source.path)
       workingDir: $(workspaces.source.path)
       securityContext:
         runAsNonRoot: false
         runAsUser: 0
       script: |
-        #!/usr/bin/env sh
+        #!/bin/sh
         set -eu
-        echo "Removing all files from ${WORKSPACE_SOURCE_PATH} ..."
-        # Delete any existing contents of the directory if it exists.
-        #
-        # We don't just "rm -rf ${WORKSPACE_SOURCE_PATH}" because ${WORKSPACE_SOURCE_PATH} might be "/" or the root of a mounted volume.
-        if [ -d "${WORKSPACE_SOURCE_PATH}" ] ; then
-          # Delete non-hidden files and directories
-          rm -rf "${WORKSPACE_SOURCE_PATH:?}"/*
-          # Delete files and directories starting with . but excluding ..
-          rm -rf "${WORKSPACE_SOURCE_PATH}"/.[!.]*
-          # Delete files and directories starting with .. plus any other character
-          rm -rf "${WORKSPACE_SOURCE_PATH}"/..?*
+        find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-clone
+spec:
+  description: Clone the project repository into the workspace.
+  params:
+    - name: url
+      type: string
+    - name: revision
+      type: string
+      default: main
+    - name: deleteExisting
+      type: string
+      default: "true"
+  workspaces:
+    - name: output
+  steps:
+    - name: clone
+      image: alpine/git:2.45.2
+      workingDir: $(workspaces.output.path)
+      script: |
+        #!/bin/sh
+        set -eu
+
+        if [ "$(params.deleteExisting)" = "true" ]; then
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf {} +
         fi
+
+        git clone \
+          --branch "$(params.revision)" \
+          --single-branch \
+          "$(params.url)" \
+          /tmp/project
+
+        cp -a /tmp/project/. .
+        rm -rf /tmp/project
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: flake8
+spec:
+  description: Install project dependencies and run Flake8.
+  workspaces:
+    - name: source
+  steps:
+    - name: lint
+      image: python:3.9-slim
+      workingDir: $(workspaces.source.path)
+      script: |
+        #!/bin/sh
+        set -eu
+        python -m pip install --upgrade pip wheel
+        pip install -r requirements.txt
+        flake8 .
 
 ---
 apiVersion: tekton.dev/v1beta1
@@ -40,20 +85,69 @@ kind: Task
 metadata:
   name: nose
 spec:
-  workspaces:
-    - name: source
+  description: Run the project unit tests with Nose.
   params:
     - name: args
-      description: Arguments to pass to nose
+      description: Arguments to pass to Nose.
       type: string
       default: "-v"
+  workspaces:
+    - name: source
   steps:
     - name: nosetests
       image: python:3.9-slim
       workingDir: $(workspaces.source.path)
       script: |
-        #!/bin/bash
-        set -e
+        #!/bin/sh
+        set -eu
         python -m pip install --upgrade pip wheel
         pip install -r requirements.txt
         nosetests $(params.args)
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: buildah
+spec:
+  description: Build and push the application container image.
+  params:
+    - name: IMAGE
+      description: Full destination image reference.
+      type: string
+  workspaces:
+    - name: source
+  steps:
+    - name: build-and-push
+      image: quay.io/buildah/stable:v1.35.0
+      workingDir: $(workspaces.source.path)
+      securityContext:
+        privileged: true
+      script: |
+        #!/bin/sh
+        set -eu
+        buildah bud --storage-driver=vfs -t "$(params.IMAGE)" .
+        buildah push --storage-driver=vfs "$(params.IMAGE)"
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: openshift-client
+spec:
+  description: Deploy the application to OpenShift.
+  params:
+    - name: SCRIPT
+      description: OpenShift CLI commands to execute.
+      type: string
+      default: oc version
+  workspaces:
+    - name: manifest-dir
+  steps:
+    - name: run-oc
+      image: quay.io/openshift/origin-cli:latest
+      workingDir: $(workspaces.manifest-dir.path)
+      script: |
+        #!/bin/sh
+        set -eu
+        $(params.SCRIPT)
